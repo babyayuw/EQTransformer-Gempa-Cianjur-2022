@@ -3,12 +3,14 @@ import glob, os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import numpy as np
 from obspy import read, UTCDateTime
 import math
+import datetime
 
-EP_LAT = -6.862
-EP_LON = 107.059
+EP_LAT = -6.853
+EP_LON = 107.095
 
 station_coords = {
     "ACJM": [-6.8033,  108.6151],
@@ -46,50 +48,33 @@ def haversine(lat1, lon1, lat2, lon2):
     R = 6371
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    a = (math.sin(dlat/2)**2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+         * math.sin(dlon/2)**2)
     return R * 2 * math.asin(math.sqrt(a))
 
-detections_dir = r"D:\BMKG\EQTransformer\detections_cianjur"
-mseed_dir      = r"D:\BMKG\EQTransformer\preprocessed_cianjur"
-output_dir     = r"D:\BMKG\EQTransformer\plots_gempa_utama"
+mseed_dir  = r"D:\BMKG\EQTransformer\preprocessed_cianjur"
+output_dir = r"D:\BMKG\EQTransformer\plots_gempa_utama"
 os.makedirs(output_dir, exist_ok=True)
 
-# Window waveform: 30 detik sebelum hingga 150 detik sesudah origin time
-T1      = UTCDateTime("2022-11-21T06:20:40")  # -30 detik
-T2      = UTCDateTime("2022-11-21T06:23:40")  # +150 detik
-EQ_TIME = pd.Timestamp("2022-11-21 06:21:10")
+# ── Origin time & window ───────────────────────────────────────────────────────
+ORIGIN_UTC = datetime.datetime(2022, 11, 21, 6, 21, 10)   # 06:21:10 UTC
 
-csv_files = glob.glob(os.path.join(detections_dir, "*_outputs", "*_prediction_results.csv"))
+# -20 s sebelum origin  →  +100 s setelah origin
+XMIN = ORIGIN_UTC - datetime.timedelta(seconds=20)   # 06:20:50
+XMAX = ORIGIN_UTC + datetime.timedelta(seconds=100)  # 06:22:50
+
+T1 = UTCDateTime(XMIN)
+T2 = UTCDateTime(XMAX)
+
 station_data = []
 
-for f in sorted(csv_files):
-    sta = os.path.basename(os.path.dirname(f)).replace("_outputs","")
-    if sta in skip or sta not in station_coords:
+for sta, coords in station_coords.items():
+    if sta in skip:
         continue
 
-    lat, lon = station_coords[sta]
+    lat, lon = coords
     dist = haversine(EP_LAT, EP_LON, lat, lon)
-
-    df = pd.read_csv(f)
-    df['event_start_time'] = pd.to_datetime(df['event_start_time'])
-    df['p_arrival_time']   = pd.to_datetime(df['p_arrival_time'])
-    df['s_arrival_time']   = pd.to_datetime(df['s_arrival_time'])
-
-    # Window picks: sedikit lebih lebar dari waveform agar tidak ada yang kelewat
-    event = df[(df['event_start_time'] >= "2022-11-21 06:19:00") &
-               (df['event_start_time'] <= "2022-11-21 06:24:00") &
-               (df['detection_probability'] >= 0.7)]
-
-    p_picks, s_picks = [], []
-    for _, row in event.iterrows():
-        if pd.notna(row['p_arrival_time']):
-            p_sec = (row['p_arrival_time'] - EQ_TIME).total_seconds()
-            if -30 <= p_sec <= 150:
-                p_picks.append(p_sec)
-        if pd.notna(row['s_arrival_time']):
-            s_sec = (row['s_arrival_time'] - EQ_TIME).total_seconds()
-            if -30 <= s_sec <= 150:
-                s_picks.append(s_sec)
 
     mseed_file = os.path.join(mseed_dir, f"IA.{sta}.preprocessed.mseed")
     if not os.path.exists(mseed_file):
@@ -106,79 +91,104 @@ for f in sorted(csv_files):
         if maxval > 0:
             data = data / maxval
 
-        starttime = tr.stats.starttime.datetime
-        times_sec = [(starttime + pd.Timedelta(seconds=i/tr.stats.sampling_rate) - EQ_TIME).total_seconds()
-                     for i in range(len(data))]
+        t0 = tr.stats.starttime.datetime
+        dt = 1.0 / tr.stats.sampling_rate
+        times_dt = [t0 + datetime.timedelta(seconds=i * dt) for i in range(len(data))]
 
         station_data.append({
             'sta': sta, 'dist': dist,
-            'times': times_sec, 'data': data,
-            'p_picks': p_picks, 's_picks': s_picks
+            'times': times_dt, 'data': data,
         })
-        print(f"  OK: {sta} — {dist:.1f} km | {len(p_picks)} P, {len(s_picks)} S")
+        print(f"  OK: {sta} — {dist:.1f} km")
 
     except Exception as e:
         print(f"  Error {sta}: {e}")
 
 station_data.sort(key=lambda x: x['dist'])
 
-# ── Plot ───────────────────────────────────────────────
-scale   = 7
-spacing = 20
+# ── Parameter plot ─────────────────────────────────────────────────────────────
+scale   = 2.5
+spacing = 3.0
 clip    = 0.85
 
-fig, ax = plt.subplots(figsize=(12, len(station_data) * 0.7 + 1))
+n_sta  = len(station_data)
+fig_h  = max(8, n_sta * 0.23 + 1.8)
+fig_w  = 14
 
-p_label_done = False
-s_label_done = False
+fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
 for i, sd in enumerate(station_data):
     offset = i * spacing
 
-    wave = np.clip(np.array(sd['data']) * scale,
-                   -spacing * clip / 2,
-                    spacing * clip / 2) + offset
+    wave = np.clip(
+        np.array(sd['data']) * scale,
+        -spacing * clip / 2,
+         spacing * clip / 2
+    ) + offset
 
-    ax.plot(sd['times'], wave, 'k-', linewidth=0.6, alpha=0.9)
+    ax.plot(sd['times'], wave, 'k-', linewidth=0.4, alpha=0.9)
 
-    pick_half = spacing * 0.15
+    # Label stasiun di dalam plot, sisi kiri, sejajar waveform
+    ax.text(
+        XMIN, offset,
+        f"{sd['sta']} ({sd['dist']:.2f} km)",
+        fontsize=7.5,
+        fontweight='bold',
+        va='center',
+        ha='left',
+        color='#111111',
+        bbox=dict(
+            boxstyle='round,pad=0.25',
+            facecolor='#FFF9C4',
+            edgecolor='#F9A825',
+            linewidth=0.6,
+            alpha=0.95
+        ),
+        zorder=5,
+        clip_on=False
+    )
 
-    for p in sd['p_picks']:
-        ax.vlines(p, offset - pick_half, offset + pick_half,
-                  colors='blue', linewidth=1.0, alpha=0.85,
-                  label='P pick' if not p_label_done else "")
-        p_label_done = True
+# ── Garis origin time ──────────────────────────────────────────────────────────
+origin_line = ax.axvline(
+    ORIGIN_UTC,
+    color='#D32F2F',
+    linewidth=1.3,
+    linestyle='--',
+    zorder=4,
+    label='Origin time (06:21:10 UTC)'
+)
 
-    for s in sd['s_picks']:
-        ax.vlines(s, offset - pick_half, offset + pick_half,
-                  colors='red', linewidth=1.0, alpha=0.85,
-                  label='S pick' if not s_label_done else "")
-        s_label_done = True
+# ── Legend ─────────────────────────────────────────────────────────────────────
+ax.legend(
+    handles=[origin_line],
+    loc='upper right',
+    fontsize=9,
+    framealpha=0.92,
+    edgecolor='#BBBBBB'
+)
 
-    ax.text(-29, offset + spacing * 0.35,
-            f"{sd['sta']} ({sd['dist']:.0f} km)",
-            fontsize=6.5, va='bottom', ha='left', color='black',
-            bbox=dict(boxstyle='round,pad=0.15', facecolor='#FFF8DC',
-                      edgecolor='none', alpha=0.9))
+# ── Sumbu X: label tiap 10 detik, format HH:MM:SS ─────────────────────────────
+ax.xaxis.set_major_locator(mdates.SecondLocator(bysecond=range(0, 60, 10)))
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha='right', fontsize=8.5)
 
-ax.axvline(0, color='green', linewidth=1.5, linestyle='--',
-           label='Origin time (06:21:10 UTC)')
+ax.set_xlim(XMIN, XMAX)
 
-yticks      = [i * spacing for i in range(len(station_data))]
-yticklabels = [f"{sd['dist']:.0f}" for sd in station_data]
-ax.set_yticks(yticks)
-ax.set_yticklabels(yticklabels, fontsize=7)
+# ── Sumbu Y ────────────────────────────────────────────────────────────────────
+ax.set_yticks([])
+ax.set_yticklabels([])
 
-ax.set_xlabel("Waktu relatif terhadap origin time (detik)", fontsize=11)
-ax.set_ylabel("Jarak epicenter (km)", fontsize=11)
-ax.set_title("Record Section — Gempa Cianjur Mw 5.6\n"
-             "21 November 2022, 06:21:10 UTC (13:21:10 WIB)", fontsize=12)
-ax.legend(loc='upper right', fontsize=9)
-ax.set_xlim(-30, 150)
-ax.grid(axis='x', linestyle=':', alpha=0.4)
+ax.set_xlabel("Waktu (UTC)", fontsize=11, labelpad=6)
+ax.set_title(
+    "Waveform Plot — Gempa Cianjur Mw 5.6\n"
+    "21 November 2022, 06:21:10 UTC (13:21:10 WIB)",
+    fontsize=12, fontweight='bold', pad=8
+)
+
+ax.grid(axis='x', linestyle=':', alpha=0.35)
 plt.tight_layout()
 
-out = os.path.join(output_dir, "record_section_cianjur.png")
-plt.savefig(out, dpi=200, bbox_inches='tight')
+out = os.path.join(output_dir, "waveform_plot_cianjur.png")
+plt.savefig(out, dpi=250, bbox_inches='tight')
 plt.close()
 print(f"\nSaved: {out}")
